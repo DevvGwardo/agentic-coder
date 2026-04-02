@@ -29,11 +29,16 @@ def main():
 
     args = parser.parse_args()
 
+    MODEL_MAP = {
+        "minimax": "MiniMax-M2.7",
+        "anthropic": "anthropic",
+    }
+
     config = AgenticCoderConfig(
         workspace=args.workspace,
         scratch_dir=args.scratch_dir,
         max_workers=args.max_workers,
-        coordinator_llm=args.coordinator_model,
+        coordinator_model=MODEL_MAP.get(args.coordinator_model, args.coordinator_model),
         verbose=not args.quiet,
         timeout_per_worker_minutes=args.timeout,
     )

@@ -43,6 +43,14 @@ class CoderResult:
     spec: Optional[str] = None
 
 
+# ─── Coordinator API metrics ─────────────────────────────────────────────────
+
+coordinator_metrics = {
+    "calls": 0,
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+}
+
 # ─── MiniMax API call ────────────────────────────────────────────────────────
 
 def _complete_minimax(
@@ -84,6 +92,12 @@ def _complete_minimax(
         with urllib.request.urlopen(req, timeout=120) as resp:
             data = json.loads(resp.read())
 
+        # Track coordinator metrics
+        coordinator_metrics["calls"] += 1
+        usage = data.get("usage", {})
+        coordinator_metrics["prompt_tokens"] += usage.get("prompt_tokens", 0)
+        coordinator_metrics["completion_tokens"] += usage.get("completion_tokens", 0)
+
         msg = data["choices"][0]["message"]
         content = msg.get("content", "").strip()
 
@@ -111,6 +125,8 @@ COORDINATOR_SYSTEM = """You are a coordinating agent. Your job is to break down 
 assign work to specialized worker agents, and synthesize their findings into a coherent plan.
 
 You NEVER do the hands-on work yourself. You orchestrate.
+You have NO tools available. Do NOT output tool calls, XML tags, or function invocations.
+Output only plain text and markdown.
 
 Key principles:
 - Parallelism is your superpower. Launch independent workers concurrently.
@@ -176,7 +192,6 @@ def build_synthesis_prompt(goal: str, workspace: str, scratch_dir: str) -> str:
         "",
         "GOAL: " + goal,
         "WORKSPACE: " + workspace,
-        "SPEC_FILE: " + scratch_dir + "/spec.md",
         "",
         "Below are all worker findings. Read them carefully.",
         "",
@@ -185,16 +200,18 @@ def build_synthesis_prompt(goal: str, workspace: str, scratch_dir: str) -> str:
         "Instructions:",
         "1. Distill key facts, patterns, and decisions from the findings above",
         "2. If findings conflict, pick the best interpretation",
-        "3. Write a concrete, actionable SPEC to " + scratch_dir + "/spec.md",
+        "3. Output a concrete, actionable SPEC as your response",
+        "",
+        "IMPORTANT: You have NO tools. Do NOT output tool calls. Just output plain text.",
+        "Your ENTIRE response will be saved as the spec, so make it the spec itself.",
         "",
         "The spec MUST include:",
-        "- Exact files to change",
+        "- Exact files to change (full paths relative to workspace)",
         "- Exact changes (code snippets, not vague descriptions)",
         "- Any constraints or requirements",
         "",
-        "After writing the spec, respond with:",
-        "- A 3-5 sentence summary of findings",
-        "- Confirmation that spec.md was written",
+        "Start your response with '# Spec' and write the spec directly.",
+        "Do NOT wrap it in code fences. Do NOT write preamble. Just the spec.",
     ]
     return "\n".join(lines)
 
@@ -208,66 +225,86 @@ def build_implementation_prompt(goal: str, workspace: str, scratch_dir: str, max
     except Exception:
         spec_text = "(spec.md not found)"
 
-    # Build the example block without triple backticks inside f-string
-    # Use single ticks to avoid f-string delimiter conflict
-    code_fence = "```"
-    example_block = (
-        code_fence + "\n"
-        "WORKER i1:\n"
-        "instruction: In src/server.ts, add this route after the existing routes: "
-        "app.get('/health', (c) => c.json({status: 'ok'}))\n"
-        "workspace: " + workspace + "\n"
-        + code_fence
-    )
-
     lines = [
         "## Phase 3 — Implementation",
         "",
-        "You must produce exactly " + str(max_workers) + " worker tasks in the format below.",
-        "Write them to " + scratch_dir + "/impl-plan.md.",
+        "IMPORTANT: You have NO tools. Do NOT output tool calls.",
+        "Your job is to output WORKER task blocks that will be parsed and given to worker agents.",
         "",
-        "WORKER FORMAT (each worker gets ONE of these blocks):",
-        example_block,
+        "Read the SPEC below carefully, then output exactly " + str(max_workers) + " WORKER blocks.",
         "",
-        "SPEC (read carefully before writing tasks):",
+        "OUTPUT FORMAT — one block per worker, using this exact structure:",
+        "",
+        "WORKER i1:",
+        "instruction: <detailed instruction with exact file paths from the spec and exact code changes>",
+        "workspace: " + workspace,
+        "",
+        "WORKER i2:",
+        "instruction: <detailed instruction for a different part of the spec>",
+        "workspace: " + workspace,
+        "",
+        "(Continue for each worker up to i" + str(max_workers) + ")",
+        "",
+        "SPEC TO IMPLEMENT:",
         spec_text,
         "",
         "WORKSPACE: " + workspace,
-        "MAX_WORKERS: " + str(max_workers),
         "",
         "Rules:",
         "- Each worker must have a unique ID: i1, i2, i3... (up to i" + str(max_workers) + ")",
-        "- Each worker instruction must specify exact file paths and exact code",
-        "- Split so no two workers touch the same file unless necessary",
+        "- Each instruction must reference exact file paths and exact code from the SPEC above",
+        "- Do NOT use placeholder or example file names — use the real paths from the spec",
+        "- Split work so no two workers touch the same file unless necessary",
         "- Workers write reports to " + scratch_dir + "/worker-<id>-implementation.md",
         "",
-        "Write your " + str(max_workers) + " worker tasks to " + scratch_dir + "/impl-plan.md now.",
+        "Output your " + str(max_workers) + " WORKER blocks now. Nothing else.",
     ]
     return "\n".join(lines)
 
 
 def build_verification_prompt(goal: str, workspace: str, scratch_dir: str) -> str:
+    # Pre-read the spec and implementation reports so the coordinator has them inline
+    spec_text = ""
+    spec_path = os.path.join(scratch_dir, "spec.md")
+    try:
+        with open(spec_path) as f:
+            spec_text = f.read()[:3000]
+    except Exception:
+        spec_text = "(spec.md not found)"
+
+    impl_reports = ""
+    for fname in sorted(os.listdir(scratch_dir)):
+        if fname.startswith("worker-") and fname.endswith("-implementation.md"):
+            try:
+                with open(os.path.join(scratch_dir, fname)) as f:
+                    content = f.read()[:2000]
+                impl_reports += "\n\n## " + fname + "\n\n" + content
+            except Exception:
+                pass
+    if not impl_reports:
+        impl_reports = "(No implementation reports found)"
+
     lines = [
         "## Phase 4 — Verification",
         "",
-        "Verify the implementation against the spec.",
+        "IMPORTANT: You have NO tools. Do NOT output tool calls.",
+        "All the information you need is provided below.",
         "",
-        "SPEC: " + scratch_dir + "/spec.md",
+        "GOAL: " + goal,
         "WORKSPACE: " + workspace,
-        "SCRATCH_DIR: " + scratch_dir,
         "",
-        "Check:",
-        "1. Read spec.md and each implementation report in " + scratch_dir + "/worker-*-implementation.md",
-        "2. Verify every spec item was implemented correctly",
-        "3. Run validation commands if needed",
-        "4. Report pass/fail for each spec item",
+        "## SPEC",
+        spec_text,
         "",
-        "Write final report to: " + scratch_dir + "/verification.md",
+        "## IMPLEMENTATION REPORTS",
+        impl_reports,
         "",
-        "Respond with pass/fail for each spec item and:",
-        "  Final status: READY",
-        "or",
-        "  Final status: NEEDS_WORK",
+        "Instructions:",
+        "1. Compare each spec item against the implementation reports",
+        "2. For each spec item, output PASS or FAIL with a brief reason",
+        "3. End with exactly one of these lines:",
+        "   Final status: READY",
+        "   Final status: NEEDS_WORK",
     ]
     return "\n".join(lines)
 
@@ -416,11 +453,12 @@ def _run_worker_subprocess(
         '        "type": "function",\n'
         '        "function": {\n'
         '            "name": "read_file",\n'
-        '            "description": "Read a text file. Returns the full content or an error message.",\n'
+        '            "description": "Read a text file. Returns content starting from offset. Use offset to page through large files.",\n'
         '            "parameters": {\n'
         '                "type": "object",\n'
         '                "properties": {\n'
-        '                    "path": {"type": "string", "description": "Absolute path to the file"}\n'
+        '                    "path": {"type": "string", "description": "Absolute path to the file"},\n'
+        '                    "offset": {"type": "integer", "description": "Character offset to start reading from (default 0)", "default": 0}\n'
         '                },\n'
         '                "required": ["path"]\n'
         '            }\n'
@@ -484,20 +522,60 @@ def _run_worker_subprocess(
         '            }\n'
         '        }\n'
         '    },\n'
+        "    {\n"
+        '        "type": "function",\n'
+        '        "function": {\n'
+        '            "name": "search_file",\n'
+        '            "description": "Search a file for a pattern (regex). Returns matching lines with line numbers and surrounding context. Much faster than reading an entire large file.",\n'
+        '            "parameters": {\n'
+        '                "type": "object",\n'
+        '                "properties": {\n'
+        '                    "path": {"type": "string", "description": "Absolute path to the file"},\n'
+        '                    "pattern": {"type": "string", "description": "Regex pattern to search for"},\n'
+        '                    "context": {"type": "integer", "description": "Number of lines of context around each match (default 3)", "default": 3}\n'
+        '                },\n'
+        '                "required": ["path", "pattern"]\n'
+        '            }\n'
+        '        }\n'
+        '    },\n'
+        "    {\n"
+        '        "type": "function",\n'
+        '        "function": {\n'
+        '            "name": "edit_file",\n'
+        '            "description": "Replace exact text in a file. The old_text must match exactly (including whitespace). Use search_file first to find the exact text to replace.",\n'
+        '            "parameters": {\n'
+        '                "type": "object",\n'
+        '                "properties": {\n'
+        '                    "path": {"type": "string", "description": "Absolute path to the file"},\n'
+        '                    "old_text": {"type": "string", "description": "Exact text to find and replace"},\n'
+        '                    "new_text": {"type": "string", "description": "Text to replace it with"}\n'
+        '                },\n'
+        '                "required": ["path", "old_text", "new_text"]\n'
+        '            }\n'
+        '        }\n'
+        '    },\n'
         "]\n"
         "\n"
         "# ── Tool implementations ─────────────────────────────────────────────────\n"
         "\n"
+        "READ_CHUNK = 4000\n"
+        "\n"
         "def tool_read_file(args):\n"
         "    path = args['path']\n"
+        "    offset = args.get('offset', 0) or 0\n"
         "    if not os.path.exists(path):\n"
         "        return json.dumps({'error': 'File not found: ' + path})\n"
         "    try:\n"
         "        with open(path, 'r', encoding='utf-8') as f:\n"
         "            content = f.read()\n"
         "        size = len(content)\n"
-        "        preview = content[:500] + ('...[truncated]' if len(content) > 500 else '')\n"
-        "        return json.dumps({'size': size, 'content': preview})\n"
+        "        chunk = content[offset:offset + READ_CHUNK]\n"
+        "        has_more = (offset + READ_CHUNK) < size\n"
+        "        result = {'size': size, 'offset': offset, 'content': chunk}\n"
+        "        if has_more:\n"
+        "            result['next_offset'] = offset + READ_CHUNK\n"
+        "            result['hint'] = 'Use offset=' + str(offset + READ_CHUNK) + ' to read the next chunk'\n"
+        "        return json.dumps(result)\n"
         "    except Exception as e:\n"
         "        return json.dumps({'error': str(e)})\n"
         "\n"
@@ -546,18 +624,74 @@ def _run_worker_subprocess(
         "    kind = 'file' if os.path.isfile(path) else 'dir' if os.path.isdir(path) else 'none' if exists else 'missing'\n"
         "    return json.dumps({'path': path, 'exists': exists, 'kind': kind})\n"
         "\n"
+        "def tool_search_file(args):\n"
+        "    path = args['path']\n"
+        "    pattern = args['pattern']\n"
+        "    ctx = args.get('context', 3) or 3\n"
+        "    if not os.path.exists(path):\n"
+        "        return json.dumps({'error': 'File not found: ' + path})\n"
+        "    try:\n"
+        "        with open(path, 'r', encoding='utf-8') as f:\n"
+        "            lines = f.readlines()\n"
+        "        matches = []\n"
+        "        for i, line in enumerate(lines):\n"
+        "            if re.search(pattern, line):\n"
+        "                start = max(0, i - ctx)\n"
+        "                end = min(len(lines), i + ctx + 1)\n"
+        "                snippet = ''\n"
+        "                for j in range(start, end):\n"
+        "                    marker = '>>>' if j == i else '   '\n"
+        "                    snippet += marker + str(j + 1).rjust(4) + ' | ' + lines[j]\n"
+        "                matches.append({'line': i + 1, 'snippet': snippet})\n"
+        "        if not matches:\n"
+        "            return json.dumps({'matches': 0, 'hint': 'No matches for pattern: ' + pattern})\n"
+        "        # Limit to first 10 matches to avoid huge responses\n"
+        "        return json.dumps({'matches': len(matches), 'results': matches[:10], 'total_lines': len(lines)})\n"
+        "    except Exception as e:\n"
+        "        return json.dumps({'error': str(e)})\n"
+        "\n"
+        "def tool_edit_file(args):\n"
+        "    path = args['path']\n"
+        "    old_text = args['old_text']\n"
+        "    new_text = args['new_text']\n"
+        "    if not os.path.exists(path):\n"
+        "        return json.dumps({'error': 'File not found: ' + path})\n"
+        "    try:\n"
+        "        with open(path, 'r', encoding='utf-8') as f:\n"
+        "            content = f.read()\n"
+        "        count = content.count(old_text)\n"
+        "        if count == 0:\n"
+        "            # Show nearby content to help debug\n"
+        "            first_line = old_text.split('\\n')[0][:60]\n"
+        "            return json.dumps({'error': 'old_text not found in file. First line searched: ' + repr(first_line), 'file_size': len(content)})\n"
+        "        if count > 1:\n"
+        "            return json.dumps({'error': 'old_text matches ' + str(count) + ' locations. Make it more specific so it matches exactly once.'})\n"
+        "        new_content = content.replace(old_text, new_text, 1)\n"
+        "        with open(path, 'w', encoding='utf-8') as f:\n"
+        "            f.write(new_content)\n"
+        "        return json.dumps({'ok': True, 'path': path, 'replaced': 1})\n"
+        "    except Exception as e:\n"
+        "        return json.dumps({'error': str(e)})\n"
+        "\n"
         "TOOL_IMPLS = {\n"
         "    'read_file': tool_read_file,\n"
         "    'write_file': tool_write_file,\n"
         "    'list_dir': tool_list_dir,\n"
         "    'shell': tool_shell,\n"
         "    'path_exists': tool_path_exists,\n"
+        "    'search_file': tool_search_file,\n"
+        "    'edit_file': tool_edit_file,\n"
         "}\n"
+        "\n"
+        "# ── API metrics ──────────────────────────────────────────────────────────\n"
+        "\n"
+        "api_metrics = {'calls': 0, 'prompt_tokens': 0, 'completion_tokens': 0, 'errors': 0}\n"
         "\n"
         "# ── API call ─────────────────────────────────────────────────────────────\n"
         "\n"
         "def llm_complete(messages, tools=None, tool_choice='auto'):\n"
         "    global TOOL_CALL_ID\n"
+        "    api_metrics['calls'] += 1\n"
         "    payload = {\n"
         "        'model': MODEL,\n"
         "        'messages': messages,\n"
@@ -586,11 +720,17 @@ def _run_worker_subprocess(
         "                for val in msg.values():\n"
         "                    if isinstance(val, str) and len(val) > 10:\n"
         "                        content = val.strip(); break\n"
+        "            # Track token usage if available\n"
+        "            usage = raw.get('usage', {})\n"
+        "            api_metrics['prompt_tokens'] += usage.get('prompt_tokens', 0)\n"
+        "            api_metrics['completion_tokens'] += usage.get('completion_tokens', 0)\n"
         "            return {'content': content, 'raw': raw}\n"
         "    except urllib.error.HTTPError as e:\n"
+        "        api_metrics['errors'] += 1\n"
         "        body = e.read().decode()[:500]\n"
         "        return {'error': 'HTTP ' + str(e.code) + ': ' + body}\n"
         "    except Exception as e:\n"
+        "        api_metrics['errors'] += 1\n"
         "        return {'error': str(e)}\n"
         "\n"
         "# ── Main loop ────────────────────────────────────────────────────────────\n"
@@ -601,10 +741,13 @@ def _run_worker_subprocess(
         '    "WORKER_ID: " + WORKER_ID + "\\n" +\n'
         '    "PHASE: " + PHASE + "\\n" +\n'
         '    "GOAL: " + GOAL + "\\n\\n" +\n'
-        '    "AVAILABLE TOOLS: read_file, write_file, list_dir, shell, path_exists\\n" +\n'
+        '    "AVAILABLE TOOLS: read_file, write_file, edit_file, search_file, list_dir, shell, path_exists\\n" +\n'
         '    "RULES:\\n" +\n'
-        '    "- ALWAYS use tools when you need to read, write, or run commands\\n" +\n'
-        '    "- Do NOT try to guess what files contain — use read_file\\n" +\n'
+        '    "- Use search_file to find functions/patterns — much faster than reading entire files\\n" +\n'
+        '    "- Use edit_file to make targeted changes (find-and-replace) — preferred over write_file for modifications\\n" +\n'
+        '    "- Use read_file only when you need to see the full structure of a small file or a specific section\\n" +\n'
+        '    "- In the implementation phase, you MUST actually modify the workspace files using edit_file or write_file\\n" +\n'
+        '    "- Do NOT just describe changes — apply them to the actual files\\n" +\n'
         '    "- When done, write a summary report to: " + SCRATCH_DIR + "/worker-" + WORKER_ID + "-" + PHASE + ".md\\n" +\n'
         '    "- In the summary, include the exact changes you made and files touched\\n" +\n'
         '    "- End the summary with this exact line on its own: " + WORKER_COMPLETION_MARKER + "\\n\\n" +\n'
@@ -612,21 +755,77 @@ def _run_worker_subprocess(
         '    INSTRUCTION\n'
         ")\n"
         "\n"
+        "MAX_CONTEXT_MESSAGES = 20  # keep system + last N messages\n"
+        "\n"
+        "def compact_messages(msgs):\n"
+        "    \"\"\"Sliding window: summarize old messages, keep recent ones.\"\"\"\n"
+        "    if len(msgs) <= MAX_CONTEXT_MESSAGES + 1:  # +1 for system\n"
+        "        return msgs\n"
+        "    system = msgs[0]\n"
+        "    old = msgs[1:-MAX_CONTEXT_MESSAGES]\n"
+        "    recent = msgs[-MAX_CONTEXT_MESSAGES:]\n"
+        "    # Summarize what was done in old messages\n"
+        "    actions = []\n"
+        "    files_read = set()\n"
+        "    files_written = set()\n"
+        "    for m in old:\n"
+        "        if m.get('role') == 'assistant':\n"
+        "            tcs = m.get('tool_calls', [])\n"
+        "            for tc in tcs:\n"
+        "                fn = tc.get('function', {})\n"
+        "                name = fn.get('name', '')\n"
+        "                raw = fn.get('arguments', '{}')\n"
+        "                if isinstance(raw, str):\n"
+        "                    try: a = json.loads(raw)\n"
+        "                    except: a = {}\n"
+        "                else: a = raw\n"
+        "                if name in ('read_file', 'search_file'):\n"
+        "                    files_read.add(a.get('path', '?'))\n"
+        "                elif name in ('write_file', 'edit_file'):\n"
+        "                    files_written.add(a.get('path', '?'))\n"
+        "            text = m.get('content', '')\n"
+        "            if text and len(text) > 20:\n"
+        "                actions.append(text[:100])\n"
+        "    summary = 'CONTEXT SUMMARY (older messages compacted):\\n'\n"
+        "    if files_read:\n"
+        "        summary += 'Files read: ' + ', '.join(sorted(files_read)[-5:]) + '\\n'\n"
+        "    if files_written:\n"
+        "        summary += 'Files modified: ' + ', '.join(sorted(files_written)[-5:]) + '\\n'\n"
+        "    if actions:\n"
+        "        summary += 'Recent actions: ' + '; '.join(actions[-3:]) + '\\n'\n"
+        "    return [system, {'role': 'user', 'content': summary}] + recent\n"
+        "\n"
         "messages = [\n"
         "    {'role': 'system', 'content': SYSTEM_PROMPT},\n"
         "    {'role': 'user', 'content': 'Work on your task now.'}\n"
         "]\n"
         "iterations = 0\n"
         "done = False\n"
+        "last_tool_calls = []\n"
+        "repeat_count = 0\n"
         "\n"
         "while iterations < MAX_ITERATIONS and not done:\n"
         "    iterations += 1\n"
         "    print('[worker-' + WORKER_ID + '] iteration ' + str(iterations) + '/' + str(MAX_ITERATIONS), flush=True)\n"
         "\n"
+        "    # Proactive context compaction\n"
+        "    messages = compact_messages(messages)\n"
+        "\n"
+        "    # If near iteration limit, force a wrap-up\n"
+        "    if iterations >= MAX_ITERATIONS - 2:\n"
+        "        messages.append({'role': 'user', 'content': 'You are running out of iterations. Write your findings report NOW to ' + SCRATCH_DIR + '/worker-' + WORKER_ID + '-' + PHASE + '.md and include ' + WORKER_COMPLETION_MARKER + ' at the end.'})\n"
+        "\n"
         "    resp = llm_complete(messages, tools=TOOLS)\n"
         "\n"
         "    if 'error' in resp:\n"
-        "        print('[worker-' + WORKER_ID + '] API error: ' + str(resp['error']), flush=True)\n"
+        "        err_str = str(resp['error'])\n"
+        "        print('[worker-' + WORKER_ID + '] API error: ' + err_str, flush=True)\n"
+        "        # MiniMax rejects tool_call_ids when context has stale references.\n"
+        "        # Force aggressive compaction and retry.\n"
+        "        if 'tool id' in err_str.lower() or 'tool_call_id' in err_str.lower() or ('400' in err_str and 'not found' in err_str):\n"
+        "            print('[worker-' + WORKER_ID + '] compacting context and retrying...', flush=True)\n"
+        "            messages = [messages[0]] + [m for m in messages[1:] if m.get('role') not in ('tool',)] [-4:]\n"
+        "            continue\n"
         "        break\n"
         "\n"
         "    raw = resp.get('raw', {})\n"
@@ -686,6 +885,18 @@ def _run_worker_subprocess(
         "            'content': result\n"
         "        })\n"
         "\n"
+        "    # Stuck-loop detection: if calling the same tools 3x in a row, nudge\n"
+        "    current_calls = [(tc.get('function',{}).get('name',''), tc.get('function',{}).get('arguments','')) for tc in tool_calls]\n"
+        "    if current_calls == last_tool_calls:\n"
+        "        repeat_count += 1\n"
+        "    else:\n"
+        "        repeat_count = 0\n"
+        "    last_tool_calls = current_calls\n"
+        "    if repeat_count >= 2:\n"
+        "        print('[worker-' + WORKER_ID + '] stuck loop detected — nudging to finish', flush=True)\n"
+        "        messages.append({'role': 'user', 'content': 'You seem to be repeating the same action. You have enough information. Write your findings report NOW to ' + SCRATCH_DIR + '/worker-' + WORKER_ID + '-' + PHASE + '.md using the write_file tool. End the report with: ' + WORKER_COMPLETION_MARKER})\n"
+        "        repeat_count = 0\n"
+        "\n"
         "# Write final report\n"
         "report_path = os.path.join(SCRATCH_DIR, 'worker-' + WORKER_ID + '-' + PHASE + '.md')\n"
         "if not os.path.exists(report_path):\n"
@@ -694,7 +905,14 @@ def _run_worker_subprocess(
         "        f.write('\\nIterations: ' + str(iterations) + '/' + str(MAX_ITERATIONS) + '\\n')\n"
         "        f.write('\\n' + WORKER_COMPLETION_MARKER + '\\n')\n"
         "\n"
-        "print('[worker-' + WORKER_ID + '] done (iterations=' + str(iterations) + ', done=' + str(done) + ')', flush=True)\n"
+        "# Write API metrics\n"
+        "metrics_path = os.path.join(SCRATCH_DIR, 'worker-' + WORKER_ID + '-' + PHASE + '-metrics.json')\n"
+        "api_metrics['iterations'] = iterations\n"
+        "api_metrics['done'] = done\n"
+        "with open(metrics_path, 'w') as f:\n"
+        "    json.dump(api_metrics, f)\n"
+        "\n"
+        "print('[worker-' + WORKER_ID + '] done (iterations=' + str(iterations) + ', done=' + str(done) + ', api_calls=' + str(api_metrics['calls']) + ', tokens=' + str(api_metrics['prompt_tokens'] + api_metrics['completion_tokens']) + ')', flush=True)\n"
     )
 
     log_file = os.path.join(scratch_dir, f"worker-{worker_id}.log")
@@ -926,18 +1144,34 @@ class AgenticCoder:
         """Extract the spec content from coordinator's text output."""
         if not text:
             return ""
-        # Try fenced code block first
+
         import re
-        m = re.search(r"```(?:spec|markdown)?\n(.*?)```", text, re.DOTALL)
+
+        # Strip any hallucinated tool calls (MiniMax sometimes outputs these)
+        cleaned = re.sub(
+            r"<minimax:tool_call>.*?</minimax:tool_call>",
+            "", text, flags=re.DOTALL,
+        )
+        cleaned = re.sub(
+            r"\[TOOL_CALL\].*?\[/TOOL_CALL\]",
+            "", cleaned, flags=re.DOTALL,
+        )
+        cleaned = cleaned.strip()
+
+        if not cleaned:
+            return ""
+
+        # The prompt tells the coordinator to output ONLY the spec.
+        # Use the full response. If it starts with preamble before a
+        # "# Spec" heading, trim the preamble.
+        m = re.search(r"(#+ [Ss]pec\b.*)", cleaned, re.DOTALL)
         if m:
             return m.group(1).strip()
-        # Try "SPEC:" or "## Spec" section
-        m = re.search(r"(?:SPEC:|## SPEC)(.*?)(?:\n##|\Z)", text, re.DOTALL | re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
-        # Fall back: if it looks like a spec (has file paths, code snippets), return it
-        if "file" in text.lower() and ("```" in text or "def " in text or "import " in text):
-            return text.strip()
+
+        # No heading found — the whole response IS the spec
+        if len(cleaned) > 100:
+            return cleaned
+
         return ""
 
     def _run_implementation(self, goal: str) -> PhaseResult:
@@ -1060,7 +1294,38 @@ class AgenticCoder:
         is_ready = v.coordinator_output.upper().count("READY") > v.coordinator_output.upper().count("NEEDS_WORK")
         final_status = "ready" if is_ready else "needs_work"
 
+        # Collect and write combined metrics
+        total_metrics = {
+            "coordinator": dict(coordinator_metrics),
+            "workers": {},
+        }
+        for fname in os.listdir(self._scratch_dir):
+            if fname.endswith("-metrics.json"):
+                try:
+                    with open(os.path.join(self._scratch_dir, fname)) as f:
+                        total_metrics["workers"][fname] = json.load(f)
+                except Exception:
+                    pass
+        # Compute totals
+        total_calls = coordinator_metrics["calls"]
+        total_prompt = coordinator_metrics["prompt_tokens"]
+        total_completion = coordinator_metrics["completion_tokens"]
+        for wm in total_metrics["workers"].values():
+            total_calls += wm.get("calls", 0)
+            total_prompt += wm.get("prompt_tokens", 0)
+            total_completion += wm.get("completion_tokens", 0)
+        total_metrics["totals"] = {
+            "api_calls": total_calls,
+            "prompt_tokens": total_prompt,
+            "completion_tokens": total_completion,
+            "total_tokens": total_prompt + total_completion,
+        }
+        metrics_path = os.path.join(self._scratch_dir, "metrics.json")
+        with open(metrics_path, "w") as f:
+            json.dump(total_metrics, f, indent=2)
+
         self._log(f"Done. final_status={final_status}")
+        self._log(f"API calls: {total_calls}, tokens: {total_prompt + total_completion}")
         self._log(f"Scratch dir: {self._scratch_dir}")
 
         return CoderResult(
